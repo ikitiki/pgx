@@ -141,6 +141,14 @@ func appendDescribe(buf []byte, objectType byte, name string) []byte {
 	return buf
 }
 
+// appendFlush appends a PostgreSQL wire protocol flush message to buf and returns it.
+func appendFlush(buf []byte) []byte {
+	buf = append(buf, 'H')
+	buf = pgio.AppendInt32(buf, 4)
+
+	return buf
+}
+
 // appendSync appends a PostgreSQL wire protocol sync message to buf and returns it.
 func appendSync(buf []byte) []byte {
 	buf = append(buf, 'S')

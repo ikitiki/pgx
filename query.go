@@ -450,6 +450,24 @@ func (c *Conn) QueryEx(ctx context.Context, sql string, options *QueryExOptions,
 
 	ps, ok := c.preparedStatements[sql]
 	if !ok {
+		if !(options == nil && c.config.PreferSimpleProtocol) && !(options != nil && options.SimpleProtocol) {
+			err = c.waitForPreviousCancelQuery(ctx)
+			if err != nil {
+				return nil, err
+			}
+
+			fieldDescription, err := c.unnamedStatementOneRoundTripQuery(sql, args)
+			if err != nil {
+				rows.fatal(err)
+				return rows, err
+			}
+			c.pendingReadyForQueryCount++
+
+			rows.sql = sql
+			rows.fields = fieldDescription
+			return rows, nil
+		}
+
 		var err error
 		ps, err = c.prepareEx("", sql, nil)
 		if err != nil {
@@ -466,6 +484,84 @@ func (c *Conn) QueryEx(ctx context.Context, sql string, options *QueryExOptions,
 	}
 
 	return rows, rows.err
+}
+
+func (c *Conn) unnamedStatementOneRoundTripQuery(sql string, args []interface{}) ([]FieldDescription, error) {
+	var (
+		paramOids         []pgtype.OID
+		resultFormatCodes []int16
+		fieldDescriptions []FieldDescription
+	)
+
+	buf := appendParse(c.wbuf, "", sql, []pgtype.OID{})
+	buf = appendDescribe(buf, 'S', "")
+	buf = appendFlush(buf)
+
+	n, err := c.conn.Write(buf)
+	if err != nil && fatalWriteErr(n, err) {
+		c.die(err)
+		panic(err)
+	}
+
+forLoop:
+	for {
+		msg, err := c.rxMsg()
+		if err != nil {
+			return nil, err
+		}
+
+		switch msg := msg.(type) {
+		case *pgproto3.ParseComplete:
+		case *pgproto3.NoData:
+		case *pgproto3.ErrorResponse:
+			err := c.rxErrorResponse(msg)
+
+			buf := appendSync(c.wbuf)
+			if n, err := c.conn.Write(buf); err != nil && fatalWriteErr(n, err) {
+				c.die(err)
+				panic(err)
+			}
+			c.pendingReadyForQueryCount++
+
+			return nil, err
+		case *pgproto3.ParameterDescription:
+			paramOids = c.rxParameterDescription(msg)
+		case *pgproto3.RowDescription:
+			fieldDescriptions = c.rxRowDescription(msg)
+			for i := range fieldDescriptions {
+				resultFormatCodes = append(resultFormatCodes, fieldDescriptions[i].FormatCode)
+
+				if dt, ok := c.ConnInfo.DataTypeForOID(fieldDescriptions[i].DataType); ok {
+					fieldDescriptions[i].DataTypeName = dt.Name
+				} else {
+					return nil, errors.Errorf("unknown oid: %d", fieldDescriptions[i].DataType)
+				}
+			}
+
+			break forLoop
+		default:
+			return nil, errors.Errorf("Unexpected %T message", msg)
+		}
+	}
+
+	if len(paramOids) != len(args) {
+		return nil, errors.Errorf("Prepared statement \"\" requires %d parameters, but %d were provided", len(paramOids), len(args))
+	}
+
+	buf, err = appendBind(c.wbuf, "", "", c.ConnInfo, paramOids, args, resultFormatCodes)
+	if err != nil {
+		return nil, err
+	}
+	buf = appendExecute(buf, "", 0)
+	buf = appendSync(buf)
+
+	n, err = c.conn.Write(buf)
+	if err != nil && fatalWriteErr(n, err) {
+		c.die(err)
+		panic(err)
+	}
+
+	return fieldDescriptions, nil
 }
 
 func (c *Conn) buildOneRoundTripQueryEx(buf []byte, sql string, options *QueryExOptions, arguments []interface{}) ([]byte, error) {
